@@ -1,0 +1,202 @@
+#include <SPI.h>
+#include <mcp_can.h>
+
+// ==================== PIN DEFINITIONS ====================
+#define TSAL_PIN 5
+#define RTDS 3
+#define AIR 2
+#define Rev_Buzzer 4
+#define led 13
+
+// ==================== CAN SETUP ====================
+#define CAN_CS 8
+MCP_CAN CAN0(CAN_CS);
+#define MCP_FREQ MCP_8MHZ   // or MCP_16MHZ if 16 MHz crystal
+
+// ==================== CONFIGURABLE PARAMETERS ====================
+#define VOLTAGE_THRESHOLD     60.0f
+#define CAN_TIMEOUT           500   // Used for status info, no longer critical
+
+// ==================== STATE VARIABLES ====================
+int i = 0; // 0 = off, 1 = RTDS buzzing, 2 = running
+bool brakePressed = false, pshPressed = false, fwdActive = false,
+     revActive = false, accActive = false;
+
+float inputVoltage = 0.0f;
+bool tsalState = false, connected = false;
+unsigned long lastCAN = 0, lastStatusPrint = 0;
+
+// ==================== HELPERS ====================
+// All outputs are ACTIVE-LOW (LOW = ON, HIGH = OFF)
+void tsalOn()  { digitalWrite(TSAL_PIN, LOW);  tsalState = true;  }
+void tsalOff() { digitalWrite(TSAL_PIN, HIGH); tsalState = false; }
+void ledOn()   { digitalWrite(led, LOW); }
+void ledOff()  { digitalWrite(led, HIGH); }
+void rtdsOn()  { digitalWrite(RTDS, LOW); }
+void rtdsOff() { digitalWrite(RTDS, HIGH); }
+void airOn()   { digitalWrite(AIR, LOW); }
+void airOff()  { digitalWrite(AIR, HIGH); }
+void revBuzzOn()  { digitalWrite(Rev_Buzzer, LOW); }
+void revBuzzOff() { digitalWrite(Rev_Buzzer, HIGH); }
+
+// ==================== SETUP ====================
+void setup() {
+  pinMode(RTDS, OUTPUT);
+  pinMode(TSAL_PIN, OUTPUT);
+  pinMode(AIR, OUTPUT);
+  pinMode(Rev_Buzzer, OUTPUT);
+  pinMode(led, OUTPUT);
+
+  // Default all OFF (HIGH)
+  digitalWrite(RTDS, HIGH);
+  digitalWrite(TSAL_PIN, HIGH);
+  digitalWrite(AIR, HIGH);
+  digitalWrite(Rev_Buzzer, HIGH);
+  digitalWrite(led, HIGH);
+
+  Serial.begin(115200);
+  Serial.println("=== eBuggy Backend — 3s RTDS, LATCHED AIR, CAN-INDEPENDENT ===");
+
+  if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_FREQ) == CAN_OK)
+    Serial.println("✅ MCP2515 Initialized");
+  else {
+    Serial.println("❌ MCP2515 Init Failed");
+    while (1);
+  }
+
+  CAN0.setMode(MCP_NORMAL);
+  Serial.println("Listening for: 0x80000100 (driver inputs)\n");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  readCAN();
+  handleVoltageLogic();
+  handleBuggyLogic();
+  printStatus();
+}
+
+// ==================== CAN READER ====================
+void readCAN() {
+  unsigned long rxId;
+  unsigned char len;
+  unsigned char buf[8];
+
+  if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+    CAN0.readMsgBuf(&rxId, &len, buf);
+    lastCAN = millis();
+    connected = true;
+
+    if (rxId == 0x80000100) {
+      brakePressed = buf[0];
+      pshPressed   = buf[1];
+      fwdActive    = buf[2];
+      revActive    = buf[3];
+      accActive    = buf[4];
+    } 
+    else if (rxId == 0x80001B01 && len >= 6) {
+      uint16_t vin_raw = ((uint16_t)buf[4] << 8) | buf[5];
+      inputVoltage = vin_raw * 0.1f;
+    }
+  }
+
+  if (millis() - lastCAN > CAN_TIMEOUT)
+    connected = false;
+}
+
+// ==================== VOLTAGE + TSAL ====================
+void handleVoltageLogic() {
+  // TSAL stays ON whenever system is active
+  if (i >= 1) {
+    tsalOn();
+    return;
+  }
+
+  // When system is off, TSAL depends on voltage
+  if (inputVoltage > VOLTAGE_THRESHOLD) tsalOn();
+  else tsalOff();
+}
+
+// ==================== BUGGY LOGIC (DEBOUNCED LATCH) ====================
+void handleBuggyLogic() {
+  static bool lastPSH = false;  
+  static unsigned long lastPressTime = 0;
+  static bool ignorePSH = false;
+
+  bool pshEdge = (pshPressed && !lastPSH);
+  lastPSH = pshPressed;
+
+  // --- STARTUP SEQUENCE ---
+  if (i == 0 && pshEdge) {
+    if (brakePressed && !fwdActive && !revActive && !accActive) {
+      Serial.println("Startup OK → AIR ON (STATE 1)");
+      airOn();
+      ledOn();
+      tsalOn();
+      i = 1;
+      ignorePSH = true;              // lockout PSH during RTDS
+    } else {
+      Serial.println("Startup blocked (unsafe conditions)");
+    }
+  }
+
+  // --- RTDS BUZZ ---
+  if (i == 1) {
+    Serial.println("STATE 1: RTDS buzzing 3s");
+    rtdsOn();
+    delay(3000);
+    rtdsOff();
+    Serial.println("RTDS done → STATE 2");
+    i = 2;
+    lastPressTime = millis();        // start the post-RTDS timer
+  }
+
+  // --- RUNNING STATE ---
+  if (i >= 2) {
+    if (revActive) revBuzzOn();
+    else revBuzzOff();
+
+    // Ignore PSH during RTDS or immediately after startup
+    if (ignorePSH && millis() - lastPressTime < 2500) return;
+    ignorePSH = false;
+
+    // --- SHUTDOWN SEQUENCE ---
+    if (pshEdge) {
+      if (brakePressed && !fwdActive && !revActive && !accActive) {
+        Serial.println("Shutdown OK → AIR OFF");
+        airOff();
+        ledOff();
+        tsalOff();
+        i = 0;
+      } else {
+        Serial.println("Unsafe to shutdown.");
+      }
+    }
+  }
+}
+
+// ==================== STATUS PRINTER ====================
+void printStatus() {
+  if (millis() - lastStatusPrint >= 1000) {
+    lastStatusPrint = millis();
+    Serial.print("[AIR: ");
+    Serial.print(digitalRead(AIR) == LOW ? "ON" : "OFF");
+    Serial.print("] [TSAL: ");
+    Serial.print(tsalState ? "ON" : "OFF");
+    Serial.print("] [Brake: ");
+    Serial.print(brakePressed ? "PRESSED" : "RELEASED");
+    Serial.print("] [PSH: ");
+    Serial.print(pshPressed ? "PRESSED" : "RELEASED");
+    Serial.print("] [FWD: ");
+    Serial.print(fwdActive ? "ON" : "OFF");
+    Serial.print("] [REV: ");
+    Serial.print(revActive ? "ON" : "OFF");
+    Serial.print("] [ACC: ");
+    Serial.print(accActive ? "ON" : "OFF");
+    Serial.print("] [Connected: ");
+    Serial.print(connected ? "YES" : "NO");
+    Serial.print("] [STATE: ");
+    Serial.print(i);
+    Serial.println("]");
+  }
+}

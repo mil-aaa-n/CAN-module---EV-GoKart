@@ -1,0 +1,210 @@
+#include <SPI.h>
+#include <mcp_can.h>
+
+// ==================== PIN DEFINITIONS ====================
+#define TSAL_PIN 5        // ACTIVE-LOW
+#define RTDS 4            // ACTIVE-HIGH
+#define AIR 2             // ACTIVE-LOW
+#define Rev_Buzzer 3      // ACTIVE-HIGH
+#define led 13            // ACTIVE-LOW
+#define LIMIT_SW A1       // ACTIVE-HIGH safety (5V = OK, 10k to GND = NOT OK)
+
+// ==================== CAN ====================
+#define CAN_CS 8
+#define MCP_FREQ MCP_8MHZ
+MCP_CAN CAN0(CAN_CS);
+
+// ==================== CONFIG ====================
+#define VOLTAGE_THRESHOLD 60.0f
+#define CAN_TIMEOUT 500
+
+// ==================== STATE ====================
+int i = 0; // 0=OFF, 1=RTDS, 2=RUN
+
+bool brakePressed = false;
+bool pshPressed   = false;
+bool accActive    = false;
+
+bool fnrNeutral = false;
+bool fnrForward = false;
+bool fnrReverse = false;
+
+float inputVoltage = 0.0f;
+
+bool connected = false;
+
+unsigned long lastCAN = 0;
+unsigned long lastStatusPrint = 0;
+
+// RTDS timing
+unsigned long rtdsStart = 0;
+bool rtdsActive = false;
+
+// ==================== HELPERS ====================
+void tsalOn()  { digitalWrite(TSAL_PIN, LOW); }
+void tsalOff() { digitalWrite(TSAL_PIN, HIGH); }
+
+void airOn()   { digitalWrite(AIR, LOW); }
+void airOff()  { digitalWrite(AIR, HIGH); }
+
+void ledOn()   { digitalWrite(led, LOW); }
+void ledOff()  { digitalWrite(led, HIGH); }
+
+void rtdsOn()  { digitalWrite(RTDS, HIGH); }
+void rtdsOff() { digitalWrite(RTDS, LOW); }
+
+void revBuzzOn()  { digitalWrite(Rev_Buzzer, HIGH); }
+void revBuzzOff() { digitalWrite(Rev_Buzzer, LOW); }
+
+// ==================== SAFETY ====================
+bool safetyOK() {
+  // A1 must be driven to 5V
+  return digitalRead(LIMIT_SW) == HIGH;
+}
+
+// ==================== HARD SHUTDOWN ====================
+void emergencyShutdown() {
+  airOff();
+  tsalOff();
+  rtdsOff();
+  revBuzzOff();
+  ledOff();
+  i = 0;
+  rtdsActive = false;
+}
+
+// ==================== SETUP ====================
+void setup() {
+  pinMode(TSAL_PIN, OUTPUT);
+  pinMode(RTDS, OUTPUT);
+  pinMode(AIR, OUTPUT);
+  pinMode(Rev_Buzzer, OUTPUT);
+  pinMode(led, OUTPUT);
+
+  pinMode(LIMIT_SW, INPUT);   // IMPORTANT: no pullup
+
+  emergencyShutdown();
+
+  Serial.begin(115200);
+  Serial.println("=== eBuggy Backend | A1 ACTIVE-HIGH SAFETY ===");
+
+  if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_FREQ) != CAN_OK) {
+    Serial.println("CAN FAIL");
+    while (1);
+  }
+  CAN0.setMode(MCP_NORMAL);
+}
+
+// ==================== LOOP ====================
+void loop() {
+  readCAN();
+
+  // 🔴 ABSOLUTE SAFETY GATE
+  if (!safetyOK()) {
+    emergencyShutdown();
+    printStatus();
+    return;
+  }
+
+  handleVoltageLogic();
+  handleBuggyLogic();
+  printStatus();
+}
+
+// ==================== CAN ====================
+void readCAN() {
+  unsigned long rxId;
+  unsigned char len;
+  unsigned char buf[8];
+
+  if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+    CAN0.readMsgBuf(&rxId, &len, buf);
+    lastCAN = millis();
+    connected = true;
+
+    if (rxId == 0x80000100 && len >= 6) {
+      brakePressed = buf[0];
+      pshPressed   = buf[1];
+      fnrNeutral   = buf[2];
+      fnrReverse   = buf[3];
+      fnrForward   = buf[4];
+      accActive    = buf[5];
+    }
+    else if (rxId == 0x80001B01 && len >= 6) {
+      uint16_t vin_raw = ((uint16_t)buf[4] << 8) | buf[5];
+      inputVoltage = vin_raw * 0.1f;
+    }
+  }
+
+  if (millis() - lastCAN > CAN_TIMEOUT)
+    connected = false;
+}
+
+// ==================== TSAL ====================
+void handleVoltageLogic() {
+  if (i >= 1 || inputVoltage > VOLTAGE_THRESHOLD)
+    tsalOn();
+  else
+    tsalOff();
+}
+
+// ==================== BUGGY LOGIC ====================
+void handleBuggyLogic() {
+  static bool lastPSH = false;
+  bool pshEdge = (pshPressed && !lastPSH);
+  lastPSH = pshPressed;
+
+  // ---------- STARTUP ----------
+  if (i == 0 && pshEdge) {
+    if (brakePressed && fnrNeutral && !accActive && safetyOK()) {
+      airOn();
+      ledOn();
+      tsalOn();
+      i = 1;
+      rtdsActive = false;
+    }
+  }
+
+  // ---------- RTDS ----------
+  if (i == 1) {
+    if (!rtdsActive) {
+      rtdsOn();
+      rtdsStart = millis();
+      rtdsActive = true;
+    }
+    if (millis() - rtdsStart >= 3000) {
+      rtdsOff();
+      i = 2;
+    }
+  }
+
+  // ---------- RUN ----------
+  if (i == 2 && connected && fnrReverse)
+    revBuzzOn();
+  else
+    revBuzzOff();
+
+  // ---------- MANUAL SHUTDOWN ----------
+  if (i == 2 && pshEdge) {
+    if (brakePressed && fnrNeutral && !accActive) {
+      emergencyShutdown();
+    }
+  }
+}
+
+// ==================== STATUS ====================
+void printStatus() {
+  if (millis() - lastStatusPrint >= 1000) {
+    lastStatusPrint = millis();
+    Serial.print("STATE:");
+    Serial.print(i);
+    Serial.print(" A1:");
+    Serial.print(digitalRead(A1));
+    Serial.print(" SAFETY:");
+    Serial.print(safetyOK());
+    Serial.print(" AIR:");
+    Serial.print(digitalRead(AIR) == LOW);
+    Serial.print(" CAN:");
+    Serial.println(connected);
+  }
+}

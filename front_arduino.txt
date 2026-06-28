@@ -1,0 +1,75 @@
+#include <SPI.h>
+#include <mcp_can.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- PIN DEFINITIONS ---
+const int CS_TX = 10;
+const int CS_RX = 9;
+
+// --- INITIALIZATION ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+MCP_CAN CAN_TX(CS_TX);
+MCP_CAN CAN_RX(CS_RX);
+
+// --- VARIABLES ---
+unsigned long previousMillis = 0;
+unsigned int messageCounter = 0;
+const long interval = 1000; 
+
+void setup() {
+  Serial.begin(115200);
+  
+  // LCD Setup
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("CAN Speed Test");
+
+  // Initialize MCP2515 Modules at 500 Kbps (Better for 8MHz crystals)
+  if (CAN_TX.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK &&
+      CAN_RX.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
+    lcd.setCursor(0, 1);
+    lcd.print("Status: READY  ");
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print("INIT ERROR!    ");
+    while (1); 
+  }
+
+  CAN_TX.setMode(MCP_NORMAL);
+  CAN_RX.setMode(MCP_NORMAL);
+  
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  // 1. TRANSMIT
+  unsigned char data[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
+  CAN_TX.sendMsgBuf(0x100, 0, 8, data);
+
+  // 2. RECEIVE
+  if (CAN_MSGAVAIL == CAN_RX.checkReceive()) {
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char buf[8];
+    
+    CAN_RX.readMsgBuf(&rxId, &len, buf);
+    messageCounter++; 
+  }
+
+  // 3. DISPLAY
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    lcd.setCursor(0, 0);
+    lcd.print("Speed: 500 Kbps ");
+    
+    lcd.setCursor(0, 1);
+    lcd.print(messageCounter);
+    lcd.print(" Msg/Sec      ");
+
+    messageCounter = 0;
+    previousMillis = currentMillis;
+  }
+}
